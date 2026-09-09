@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -530,3 +532,188 @@ def test_timestamped_backup_flush_failure_leaves_no_empty_artifact(tmp_path, mon
         assert list(backup_dir.glob("*.sqlite3")) == []
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# POSIX lock-loss regression: _restrict_existing_sqlite_artifacts must not drop
+# the calling process's own SQLite locks on the -shm / -wal sidecars.
+#
+# Root cause: the helper opened each artifact with os.open(O_RDWR) and closed
+# the fd. POSIX fcntl locks are per-process, so closing ANY fd to a file drops
+# ALL of that process's locks on it. SQLite holds a READ lock on the WAL-index
+# (-shm) file for the lifetime of a connection; the helper's open/close cycle
+# silently released it, so a later connection close could unlink the sidecars
+# out from under a live gateway connection.
+# ---------------------------------------------------------------------------
+
+
+def _own_posix_locks_on(path: Path) -> list[tuple[str, str]]:
+    """Return (fd, lockline) pairs for this process's fds pointing at ``path``."""
+    target = str(path)
+    held: list[tuple[str, str]] = []
+    for fd_name in os.listdir("/proc/self/fd"):
+        try:
+            link = os.readlink(f"/proc/self/fd/{fd_name}")
+        except OSError:
+            continue
+        if link != target:
+            continue
+        try:
+            info = open(f"/proc/self/fdinfo/{fd_name}").read()
+        except OSError:
+            continue
+        for line in info.splitlines():
+            if line.startswith("lock:"):
+                held.append((fd_name, line))
+    return held
+
+
+def _assert_own_shm_read_lock_preserved(db_path: Path) -> None:
+    """Assert the process still holds its POSIX READ lock on the -shm file."""
+    shm = db_path.with_name(db_path.name + "-shm")
+    locks = _own_posix_locks_on(shm)
+    assert locks, f"expected this process to hold a POSIX lock on {shm}"
+    assert any("READ" in line for _, line in locks), (
+        f"expected a READ lock on {shm}, got {locks}"
+    )
+
+
+def test_restrict_existing_artifacts_preserves_own_shm_read_lock(tmp_path):
+    """The helper must not drop the caller's own WAL-index READ lock."""
+    db_path = tmp_path / "lcm.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t (v TEXT)")
+        conn.execute("INSERT INTO t VALUES ('x')")
+        conn.commit()
+        shm = db_path.with_name(db_path.name + "-shm")
+        assert shm.exists()
+        _assert_own_shm_read_lock_preserved(db_path)
+
+        sqlite_util_module._restrict_existing_sqlite_artifacts(db_path)
+
+        _assert_own_shm_read_lock_preserved(db_path)
+        # The connection must still be usable for a write + readback.
+        conn.execute("INSERT INTO t VALUES ('y')")
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_restrict_existing_artifacts_preserves_own_shm_read_lock_after_sidecar_restrict(tmp_path):
+    """Lock preservation holds even when the helper re-opens every sidecar."""
+    db_path = tmp_path / "lcm.db"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t (v TEXT)")
+        conn.execute("INSERT INTO t VALUES ('x')")
+        conn.commit()
+        for suffix in _SQLITE_SIDECAR_SUFFIXES:
+            sidecar = db_path.with_name(db_path.name + suffix)
+            if sidecar.exists():
+                sidecar.chmod(0o644)
+        _assert_own_shm_read_lock_preserved(db_path)
+
+        sqlite_util_module._restrict_existing_sqlite_artifacts(db_path)
+
+        _assert_own_shm_read_lock_preserved(db_path)
+        conn.execute("INSERT INTO t VALUES ('y')")
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
+def test_restrict_existing_artifacts_preserves_locks_and_sidecars_in_subprocess(tmp_path):
+    """Real subprocess regression: locks stay, sidecars remain, two-way writes work.
+
+    A gateway process holds the database open in WAL mode. A separate reader
+    process opens the same database, runs the restrict helper, writes, reads
+    back, and closes. The gateway's sidecars must survive the reader's close
+    (the reader must not have dropped its own locks and then unlinked the
+    sidecars out from under the gateway), and both processes must be able to
+    write and read back.
+    """
+    db_path = tmp_path / "lcm.db"
+    plugin_dir = Path(__file__).resolve().parent.parent
+
+    gateway_code = f"""
+import sqlite3, time
+conn = sqlite3.connect({str(db_path)!r}, timeout=5)
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("CREATE TABLE IF NOT EXISTS t (v TEXT)")
+conn.execute("INSERT INTO t VALUES ('gateway')")
+conn.commit()
+print("GATEWAY_READY", flush=True)
+time.sleep(30)
+"""
+
+    reader_code = f"""
+import importlib.util, os, sqlite3, sys
+from pathlib import Path
+spec = importlib.util.spec_from_file_location(
+    "sqlite_util", {str(plugin_dir / "sqlite_util.py")!r})
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+db = {str(db_path)!r}
+conn = sqlite3.connect(db, timeout=5)
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("CREATE TABLE IF NOT EXISTS t (v TEXT)")
+conn.execute("INSERT INTO t VALUES ('reader')")
+conn.commit()
+m._restrict_existing_sqlite_artifacts(Path(db))
+# Two-way write + readback after the helper ran.
+conn.execute("INSERT INTO t VALUES ('reader-after')")
+conn.commit()
+rows = [r[0] for r in conn.execute("SELECT v FROM t ORDER BY v").fetchall()]
+print("READER_ROWS=" + "|".join(rows), flush=True)
+conn.close()
+"""
+
+    gateway = subprocess.Popen(
+        [sys.executable, "-c", gateway_code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        ready = gateway.stdout.readline().strip()
+        assert ready == "GATEWAY_READY", f"gateway failed to start: {ready}"
+
+        reader = subprocess.run(
+            [sys.executable, "-c", reader_code],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert reader.returncode == 0, f"reader failed: {reader.stderr}"
+
+        # Sidecars must still exist while the gateway holds the database open.
+        wal = db_path.with_name(db_path.name + "-wal")
+        shm = db_path.with_name(db_path.name + "-shm")
+        assert wal.exists(), "gateway WAL sidecar was unlinked by the reader"
+        assert shm.exists(), "gateway SHM sidecar was unlinked by the reader"
+
+        # The reader's two-way write + readback must have succeeded.
+        assert "READER_ROWS=gateway|reader|reader-after" in reader.stdout, (
+            f"reader write/readback failed: {reader.stdout}"
+        )
+
+        # The gateway must still be able to write and read back.
+        gateway_conn = sqlite3.connect(db_path, timeout=5)
+        try:
+            gateway_conn.execute("INSERT INTO t VALUES ('gateway-after')")
+            gateway_conn.commit()
+            rows = [
+                r[0]
+                for r in gateway_conn.execute("SELECT v FROM t ORDER BY v").fetchall()
+            ]
+            assert rows == ["gateway", "gateway-after", "reader", "reader-after"], rows
+        finally:
+            gateway_conn.close()
+    finally:
+        gateway.kill()
+        gateway.wait()

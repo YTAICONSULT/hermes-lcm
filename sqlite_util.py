@@ -20,6 +20,13 @@ from typing import Iterator, List
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
+# Linux O_PATH: opening a file with O_PATH does not acquire or release POSIX
+# fcntl locks, so an open/close cycle on an existing artifact cannot drop the
+# calling process's own SQLite locks (SQLite holds a READ lock on the -shm
+# WAL-index file for the lifetime of a connection). Absent on non-Linux POSIX
+# (e.g. macOS), where the O_RDWR fallback preserves the historical behavior.
+_O_PATH = getattr(os, "O_PATH", None)
+
 
 def _sqlite_artifact_error(path: Path, reason: str) -> OSError:
     return OSError(errno.EPERM, f"refusing SQLite artifact {path.name!r}: {reason}", str(path))
@@ -80,20 +87,83 @@ def _chmod_sqlite_artifact_at(
     if expected is not None:
         _validate_sqlite_artifact(path, expected)
 
+    if expected is None:
+        # Creation path: the file is brand new (O_CREAT|O_EXCL), so no live
+        # SQLite connection can hold it yet and a real O_RDWR fd + fchmod is
+        # safe — it cannot drop anyone's POSIX locks. Races are handled by
+        # retrying as an existing-file restrict when O_EXCL loses.
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+        flags |= os.O_CREAT | os.O_EXCL
+        try:
+            fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
+        except FileExistsError:
+            return _chmod_sqlite_artifact_at(
+                path,
+                directory_fd=directory_fd,
+                create=False,
+            )
+        except FileNotFoundError:
+            if not allow_sidecar_disappearance:
+                raise
+            _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+            return False
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise _sqlite_artifact_error(path, "not a regular file")
+            _validate_sqlite_artifact(path, opened)
+            os.fchmod(fd, 0o600)
+            restricted = os.fstat(fd)
+            if restricted.st_nlink != 1:
+                raise _sqlite_artifact_error(path, "link count changed while restricting permissions")
+        finally:
+            os.close(fd)
+        return True
+
+    # Existing-file path. On Linux, open with O_PATH: an O_PATH open/close
+    # cycle neither acquires nor releases POSIX fcntl locks, so it cannot drop
+    # the calling process's own SQLite locks (SQLite holds a READ lock on the
+    # -shm WAL-index file for the lifetime of a connection). chmod is applied
+    # through /proc/self/fd, which resolves to the already-open inode without
+    # a pathname race. All nofollow / inode / nlink checks are preserved.
+    if _O_PATH is not None:
+        flags = _O_PATH | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_BINARY", 0)
+        try:
+            fd = os.open(path.name, flags, dir_fd=directory_fd)
+        except FileNotFoundError:
+            if not allow_sidecar_disappearance:
+                raise
+            _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+            return False
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise _sqlite_artifact_error(path, "not a regular file")
+            if not _same_file_identity(expected, opened):
+                raise _sqlite_artifact_error(path, "directory entry changed while opening")
+            if opened.st_nlink == 0 and allow_sidecar_disappearance:
+                _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+                return False
+            _validate_sqlite_artifact(path, opened)
+            os.chmod(f"/proc/self/fd/{fd}", 0o600)
+            restricted = os.fstat(fd)
+            if restricted.st_nlink == 0 and allow_sidecar_disappearance:
+                _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
+                return False
+            if restricted.st_nlink != 1:
+                raise _sqlite_artifact_error(path, "link count changed while restricting permissions")
+        finally:
+            os.close(fd)
+        return True
+
+    # Non-Linux POSIX fallback (e.g. macOS): O_RDWR + fchmod, the historical
+    # behavior. O_PATH is Linux-only, so this branch cannot run on Linux.
     flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
-    if expected is None:
-        flags |= os.O_CREAT | os.O_EXCL
     try:
         fd = os.open(path.name, flags, 0o600, dir_fd=directory_fd)
-    except FileExistsError:
-        if expected is not None:
-            raise
-        return _chmod_sqlite_artifact_at(
-            path,
-            directory_fd=directory_fd,
-            create=False,
-        )
     except FileNotFoundError:
         if not allow_sidecar_disappearance:
             raise
@@ -103,7 +173,7 @@ def _chmod_sqlite_artifact_at(
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode):
             raise _sqlite_artifact_error(path, "not a regular file")
-        if expected is not None and not _same_file_identity(expected, opened):
+        if not _same_file_identity(expected, opened):
             raise _sqlite_artifact_error(path, "directory entry changed while opening")
         if opened.st_nlink == 0 and allow_sidecar_disappearance:
             _require_sqlite_artifact_absent(path, directory_fd=directory_fd)
